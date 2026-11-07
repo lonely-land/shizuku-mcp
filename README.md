@@ -52,4 +52,4 @@ adb push app.apk /data/local/tmp/app.apk
 
 协议、工具参数和 HTTP 传输在 `mcp-core` 里，不依赖 Android，可以用 JVM 测试。Shizuku 用户服务在单独进程里执行命令，应用进程只负责界面、前台服务和回环端口。
 
-需要 Android SDK 35 和 JDK 17 或更高版本。
+需要 Android SDK 37 和 JDK 21。

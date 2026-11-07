@@ -5,21 +5,32 @@ import android.os.RemoteException;
 
 import androidx.annotation.Keep;
 
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
-import java.io.RandomAccessFile;
-
-import dev.shizukumcp.core.shell.ExecCodec;
-import dev.shizukumcp.core.shell.ExecResult;
-import dev.shizukumcp.core.shell.JdkShellExecutor;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Loaded by Shizuku in a separate process running as the ADB shell user or root.
+ * This class stays on the Android boot classpath (no Kotlin) because Shizuku loads the APK
+ * with its own class loader, and a missing Kotlin runtime there kills the shell process.
  * The destroy transaction code is the one Shizuku calls when the service is replaced.
  */
 public class ShellUserService extends IShellService.Stub {
     private static final int MAX_CHUNK = 256 * 1024;
-    private final JdkShellExecutor executor = new JdkShellExecutor();
+    private static final int MAX_STDOUT = 200_000;
+    private static final int MAX_STDERR = 40_000;
+    private final ReentrantLock lock = new ReentrantLock();
 
     public ShellUserService() {
     }
@@ -36,15 +47,23 @@ public class ShellUserService extends IShellService.Stub {
 
     @Override
     public String exec(String command, int timeoutMs) {
+        if (command == null) return resultJson(-1, "", "command is null", false, false);
+        int timeout = Math.min(Math.max(timeoutMs, 1), 120_000);
         try {
-            if (command == null) {
-                return ExecCodec.toJson(new ExecResult(-1, "", "command is null", false, false));
+            if (!lock.tryLock(timeout + 5_000L, TimeUnit.MILLISECONDS)) {
+                return resultJson(-1, "", "another shell command is still running", false, false);
             }
-            int timeout = Math.min(Math.max(timeoutMs, 1), 120_000);
-            return ExecCodec.toJson(executor.exec(command, timeout));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return resultJson(-1, "", "interrupted", false, false);
+        }
+        try {
+            return run(command, timeout);
         } catch (Throwable t) {
             String message = t.getMessage() == null ? t.toString() : t.getMessage();
-            return ExecCodec.toJson(new ExecResult(-1, "", message, false, false));
+            return resultJson(-1, "", message, false, false);
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -60,7 +79,7 @@ public class ShellUserService extends IShellService.Stub {
         if (length <= 0) return new byte[0];
         int ask = Math.min(length, MAX_CHUNK);
         File file = requireFile(path);
-        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file, "r")) {
             if (offset > 0) raf.seek(offset);
             byte[] buf = new byte[ask];
             int n = raf.read(buf);
@@ -81,7 +100,7 @@ public class ShellUserService extends IShellService.Stub {
         if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
             throw new RemoteException("cannot create directory " + parent);
         }
-        try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file, "rw")) {
             if (!append && offset == 0) raf.setLength(0);
             if (offset > 0) raf.seek(offset);
             if (data != null && data.length > 0) raf.write(data);
@@ -96,10 +115,123 @@ public class ShellUserService extends IShellService.Stub {
         return !file.exists() || file.delete();
     }
 
+    private String run(String command, int timeoutMs) throws Exception {
+        File shell = new File("/system/bin/sh");
+        String bin = shell.canExecute() ? shell.getAbsolutePath() : "sh";
+        ProcessBuilder builder = new ProcessBuilder(bin, "-c", command);
+        builder.redirectErrorStream(false);
+        File dir = new File("/data/local/tmp");
+        if (dir.isDirectory()) builder.directory(dir);
+        Process process = builder.start();
+        closeQuietly(process.getOutputStream());
+        PipeDrain stdout = new PipeDrain(process.getInputStream(), MAX_STDOUT);
+        PipeDrain stderr = new PipeDrain(process.getErrorStream(), MAX_STDERR);
+        Thread outThread = new Thread(stdout, "sh-stdout");
+        Thread errThread = new Thread(stderr, "sh-stderr");
+        outThread.setDaemon(true);
+        errThread.setDaemon(true);
+        outThread.start();
+        errThread.start();
+        boolean finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
+        if (!finished) {
+            process.destroyForcibly();
+            closeQuietly(process.getInputStream());
+            closeQuietly(process.getErrorStream());
+            process.waitFor(2, TimeUnit.SECONDS);
+        }
+        outThread.join(2_000);
+        errThread.join(2_000);
+        int code = finished ? process.exitValue() : -1;
+        return resultJson(
+                code,
+                decode(stdout.bytes()),
+                decode(stderr.bytes()),
+                !finished,
+                stdout.truncated || stderr.truncated
+        );
+    }
+
+    private static String resultJson(int exitCode, String stdout, String stderr, boolean timedOut, boolean truncated) {
+        try {
+            JSONObject json = new JSONObject();
+            json.put("exitCode", exitCode);
+            json.put("stdout", stdout == null ? "" : stdout);
+            json.put("stderr", stderr == null ? "" : stderr);
+            json.put("timedOut", timedOut);
+            json.put("truncated", truncated);
+            return json.toString();
+        } catch (Exception e) {
+            return "{\"exitCode\":-1,\"stdout\":\"\",\"stderr\":\"json encode failed\",\"timedOut\":false,\"truncated\":false}";
+        }
+    }
+
+    private static String decode(byte[] bytes) {
+        CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPLACE)
+                .onUnmappableCharacter(CodingErrorAction.REPLACE);
+        try {
+            return decoder.decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException e) {
+            return new String(bytes, StandardCharsets.UTF_8);
+        }
+    }
+
     private static File requireFile(String path) throws RemoteException {
         if (path == null || path.isEmpty() || path.indexOf('\0') >= 0) {
             throw new RemoteException("invalid path");
         }
         return new File(path);
+    }
+
+    private static void closeQuietly(InputStream stream) {
+        if (stream == null) return;
+        try {
+            stream.close();
+        } catch (IOException ignored) {
+        }
+    }
+
+    private static void closeQuietly(OutputStream stream) {
+        if (stream == null) return;
+        try {
+            stream.close();
+        } catch (IOException ignored) {
+        }
+    }
+
+    private static final class PipeDrain implements Runnable {
+        private final InputStream input;
+        private final int limit;
+        private final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        private volatile boolean truncated;
+
+        private PipeDrain(InputStream input, int limit) {
+            this.input = input;
+            this.limit = limit;
+        }
+
+        @Override
+        public void run() {
+            byte[] buf = new byte[8192];
+            int total = 0;
+            try {
+                while (true) {
+                    int n = input.read(buf);
+                    if (n < 0) break;
+                    if (total < limit) {
+                        int take = Math.min(n, limit - total);
+                        out.write(buf, 0, take);
+                    }
+                    total += n;
+                    if (total > limit) truncated = true;
+                }
+            } catch (Exception ignored) {
+                // The process was destroyed or the pipe closed.
+            }
+        }
+
+        private byte[] bytes() {
+            return out.toByteArray();
+        }
     }
 }

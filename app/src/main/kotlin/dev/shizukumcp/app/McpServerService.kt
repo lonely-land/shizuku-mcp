@@ -8,7 +8,9 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import dev.shizukumcp.core.http.McpHttpServer
 import dev.shizukumcp.core.mcp.McpEngine
 import rikka.shizuku.Shizuku
@@ -19,6 +21,8 @@ import kotlin.concurrent.thread
 class McpServerService : Service() {
     private val generation = AtomicInteger(0)
     private val foreground = AtomicBoolean(false)
+    private val bringUpStarted = AtomicBoolean(false)
+    private val main = Handler(Looper.getMainLooper())
     private var http: McpHttpServer? = null
     private var bridge: ShizukuShellBridge? = null
     private val binderDead = Shizuku.OnBinderDeadListener {
@@ -42,17 +46,29 @@ class McpServerService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
+        val stop = intent?.action == ACTION_STOP
+        // startForegroundService() kills the process unless startForeground() runs before this
+        // method returns. The screen sets STARTING before the service is even created, so that
+        // phase must not be used to skip the notification.
+        if (!foreground.get()) {
+            try {
+                startInForeground(if (stop) "正在停止…" else "正在连接 Shizuku…")
+            } catch (t: Throwable) {
+                AppRuntime.fail(t.message ?: "无法显示前台通知")
+                stopSelf()
+                return START_NOT_STICKY
+            }
+        }
+        if (stop) {
             shutdown()
             stopSelf()
             return START_NOT_STICKY
         }
-        if (http != null || AppRuntime.phase.value == AppRuntime.Phase.STARTING) {
+        if (http != null || !bringUpStarted.compareAndSet(false, true)) {
             return START_STICKY
         }
         val gen = generation.incrementAndGet()
         AppRuntime.phase.value = AppRuntime.Phase.STARTING
-        startInForeground("正在连接 Shizuku…")
         thread(name = "mcp-start", isDaemon = true) {
             try {
                 bringUp(gen)
@@ -70,9 +86,13 @@ class McpServerService : Service() {
         bridge.onDisconnected = {
             if (itIsCurrent(gen)) failAndStop("Shizuku shell 服务已断开")
         }
-        this.bridge = bridge
         bridge.connect()
-        if (!itIsCurrent(gen)) return
+        if (!itIsCurrent(gen)) {
+            bridge.onDisconnected = null
+            bridge.disconnect()
+            return
+        }
+        this.bridge = bridge
         val executor = bridge.executor()
         val identity = executor.exec("id", 5_000)
         AppRuntime.log(identity.stdout.trim().ifBlank { "Shizuku shell 已连接" })
@@ -87,6 +107,11 @@ class McpServerService : Service() {
             return
         }
         http = server
+        if (!itIsCurrent(gen)) {
+            http = null
+            server.stop()
+            return
+        }
         AppRuntime.boundPort.value = server.boundPort
         AppRuntime.phase.value = AppRuntime.Phase.RUNNING
         AppRuntime.clearError()
@@ -98,13 +123,17 @@ class McpServerService : Service() {
 
     private fun failAndStop(message: String) {
         generation.incrementAndGet()
+        bringUpStarted.set(false)
         AppRuntime.fail(message)
-        shutdownQuiet()
-        stopSelf()
+        main.post {
+            shutdownQuiet()
+            stopSelf()
+        }
     }
 
     private fun shutdown() {
         generation.incrementAndGet()
+        bringUpStarted.set(false)
         shutdownQuiet()
         AppRuntime.phase.value = AppRuntime.Phase.STOPPED
         AppRuntime.boundPort.value = null
